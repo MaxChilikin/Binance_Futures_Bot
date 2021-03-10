@@ -39,37 +39,6 @@ def configure_logging():
     return log, log_2
 
 
-def check_user_input(bot):
-    helper = "\nYou can type one of the following commands(or num):\n" \
-             "1) 'stop' if you want to close all connections and terminate bot\n" \
-             "2) 'orders' to see all session trade orders and their parameters\n" \
-             "3) 'balance' to see amount of every asset on account\n" \
-             "4) 'help' to see this message again\n"
-    print(helper)
-    while True:
-        user_input = input()
-        if user_input == 'stop' or user_input == '1':
-            print("\nStopping bot")
-            ask_user = input('\nWant close opened orders? (y/n?)\n')
-            if ask_user == 'y':
-                for order_id, order in bot.orders.items():
-                    bot.close_order(order_id=order_id)
-            break
-        elif user_input == 'orders' or user_input == '2':
-            if bot.orders:
-                for order, params in bot.orders:
-                    print(f"Order with id {order}:")
-                    for k, v in params:
-                        print(k, ':', v)
-            else:
-                print('\nNo orders yet\n')
-        elif user_input == 'balance' or user_input == '3':
-            print('\n', bot.get_account_data(), '\n')
-        elif user_input == 'help' or user_input == '4':
-            print(helper)
-    return True
-
-
 def get_interval(interval):
     checker = re.compile('^([0-9]{1,2})([mhdwM])$')
     result = re.match(checker, interval)

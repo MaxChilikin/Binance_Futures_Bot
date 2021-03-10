@@ -1,3 +1,5 @@
+
+exe/
 credentials.py
 strategy.py
 *.log

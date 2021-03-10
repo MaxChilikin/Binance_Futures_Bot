@@ -14,3 +14,7 @@ Finishing touch:
 Then you will need to open BinanceFuturesBot, place symbol you want to trade in main() and choose quantity to trade with
 If everything is fine you can remove log that write "info" level listings to not waste memory
 Write me if you need help/Twisted.whl, I'll explain more
+
+Highly recommend change this setting in regedit to prevent Binance timestamp exception:
+HKLM\SYSTEM\CurrentControlSet\services\W32Time\TimeProviders\NtpClient
+SpecialPollInterval > 3600 decimal or even less(this makes computer synch time every hour)

@@ -5,17 +5,21 @@ from time import time, sleep
 from binance.websockets import BinanceSocketManager
 from datetime import datetime
 from strategy import strategy, stoploss
-from utils import configure_logging, check_user_input
+from utils import configure_logging
 from uuid import uuid1
 from threading import Thread
-from credentials import API_KEY, API_SECRET
+from sys import exit
+from Interface import Interface
+try:
+    from credentials import API_KEY, API_SECRET
+except ImportError:
+    API_KEY = API_SECRET = None
+    exit("CAN'T RUN BOT WITHOUT API_KEY, API_SECRET FROM CREDENTIALS.PY")
 
 log, log_warns = configure_logging()[0], configure_logging()[1]
-decimal.getcontext().prec = 12
 
 
 class BinanceTrader(Thread):
-    REQUEST_DELAY = 500
 
     ORDER_STATUS_NEW = 'NEW'
     ORDER_STATUS_PARTIALLY_FILLED = 'PARTIALLY_FILLED'
@@ -26,7 +30,7 @@ class BinanceTrader(Thread):
 
     KLINE_INTERVALS = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
 
-    def __init__(self, symbol: str, api_key: str, api_secret: str, test: bool, *args, **kwargs):
+    def __init__(self, symbol: str, api_key: str, api_secret: str, window, test: bool, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.symbol = symbol
         self.ohlc = []
@@ -34,6 +38,8 @@ class BinanceTrader(Thread):
         self.test = test
         self.long = False
         self.short = False
+        self.time_offset = 500
+        self.window = window
 
         self.api_key = api_key
         self.api_secret = api_secret
@@ -42,30 +48,32 @@ class BinanceTrader(Thread):
 
     def run(self):
         ticksize = self.get_exchange_info()
-        _, high, low, _, _ = strategy(symbol=self.symbol, klines=self.get_klines, on_long=self.long,
-                                      on_short=self.short,
-                                      quantity=self.get_quantity)
         self.socket_manager.start_kline_socket(symbol=self.symbol, callback=self.callback)
         self.socket_manager.start()
         sleep(5)
         while True:
+            sleep(1)
             utc_time = datetime.utcnow()
-            if utc_time.minute == 0 and utc_time.second == 0:
+            if utc_time.minute % 5 == 0 and utc_time.second in range(0, 1):
+                self.window.write_event_value(
+                    key="Klines",
+                    value=f"Time: {datetime.utcnow()} - Close: {self.ohlc[3]} - High: {self.ohlc[1]} - "
+                          f"Low: {self.ohlc[2]}"
+                )
                 sleep(2)
-                signals, high, low, self.long, self.short = strategy(
+                signals, self.long, self.short = strategy(
                     symbol=self.symbol, klines=self.get_klines, on_long=self.long, on_short=self.short,
                     quantity=self.get_quantity
                 )
                 if signals:
                     for signal in signals:
                         self.place_order(**signal, test=self.test)
-            sl, self.long, self.short = stoploss(ohlc=self.ohlc, ticksize=ticksize, symbol=self.symbol, high=high,
-                                                 low=low,
+            sl, self.long, self.short = stoploss(ohlc=self.ohlc, ticksize=ticksize, symbol=self.symbol,
                                                  on_long=self.long, on_short=self.short, quantity=self.get_quantity)
             if sl:
                 self.place_order(**sl, test=self.test)
             if self.orders:
-                if utc_time.minute % 10 == 0 and utc_time.second == 0:
+                if utc_time.minute % 10 == 0 and utc_time.second in range(0, 1):
                     sleep(2)
                     for order_id, order in self.orders.items():
                         self.check_order(order_id=order_id)
@@ -121,7 +129,8 @@ class BinanceTrader(Thread):
         """
         account_balance = {}
         try:
-            balance = self.client.futures_account_balance(timestamp=int(round(time()) * 1000) + self.REQUEST_DELAY)
+            balance = self.client.futures_account_balance(timestamp=int(round(time()) * 1000) + self.time_offset,
+                                                          recvWindow=5000)
         except Exception as exc:
             log_warns.exception(exc)
             return {'msg': exc}
@@ -160,17 +169,18 @@ class BinanceTrader(Thread):
         params = dict(
             **kwargs,
             recvWindow=5000,
-            timestamp=int(round(time()) * 1000) + self.REQUEST_DELAY,
+            timestamp=int(round(time()) * 1000) + self.time_offset,
             newClientOrderId=order_id,
         )
         if type == 'LIMIT':
             params['timeInForce'] = 'GTC'
-        additional = ['price', 'stopPrice']
+        additional = ['price', 'stopPrice', 'quantity']
         for param, value in params.items():
             if param in additional:
-                params[param] = decimal.Decimal(value)
-            elif param == 'quantity':
-                params[param] = str(value)
+                context = decimal.Context()
+                context.prec = 12
+                new_decimal = context.create_decimal(repr(value))
+                params[param] = format(new_decimal, 'f')
         try:
             self.client.futures_create_order(**params)
         except Exception as exc:
@@ -185,7 +195,8 @@ class BinanceTrader(Thread):
             self.client.futures_cancel_order(
                 symbol=self.symbol,
                 origClientOrderId=order_id,
-                timestamp=int(round(time()) * 1000) + self.REQUEST_DELAY
+                timestamp=int(round(time()) * 1000) + self.time_offset,
+                recvWindow=5000
             )
         except Exception as exc:
             log_warns.exception('Order cancel failed %s ', exc)
@@ -198,7 +209,8 @@ class BinanceTrader(Thread):
         try:
             order = self.client.futures_get_order(symbol=self.symbol,
                                                   origClientOrderId=order_id,
-                                                  timestamp=int(round(time())), )
+                                                  timestamp=int(round(time()) * 1000) + self.time_offset,
+                                                  recvWindow=5000)
             if order['status'] == self.ORDER_STATUS_NEW:
                 pass
             elif order['status'] == self.ORDER_STATUS_FILLED or order['status'] == self.ORDER_STATUS_PARTIALLY_FILLED:
@@ -251,24 +263,21 @@ class BinanceTrader(Thread):
         """
         kline_info = msg['k']
         self.ohlc = [kline_info['o'], kline_info['h'], kline_info['l'], kline_info['c']]
-        print(f"Time: {time()} - Close: {kline_info['c']} - High: {kline_info['h']} - Low: {kline_info['l']}   ",
-              flush=True)
 
 
 def main():
     symbol = 'BTCUSDT'
-    test = True
+    test = False
+    ui = Interface()
+    window = ui.start_window()
     bot = BinanceTrader(
         symbol=symbol,
         test=test,
         api_key=API_KEY,
         api_secret=API_SECRET,
+        window=window
     )
-    bot.start()
-    if check_user_input(bot=bot):
-        bot.socket_manager.close()
-        bot.join(timeout=5)
-        print("STOP")
+    ui.run(bot=bot, window=window)
 
 
 if __name__ == '__main__':
