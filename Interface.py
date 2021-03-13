@@ -1,4 +1,5 @@
 import PySimpleGUI as sg
+from twisted.internet import reactor
 
 
 class Interface:
@@ -12,11 +13,12 @@ class Interface:
             "Balance": "Show amount of every asset on account",
         }
         self.layout = list()
+        self.main_window = None
 
-    def run(self, bot, window):
+    def run(self, bot):
         bot.start()
         while True:
-            event, values = window.read()
+            event, values = self.main_window.read()
             if event == sg.WIN_CLOSED:
                 break
             elif event == "Stop":
@@ -36,18 +38,23 @@ class Interface:
             elif event == "Orders":
                 if bot.orders:
                     for order, params in bot.orders:
-                        window['out'+sg.WRITE_ONLY_KEY].print(f"Order with id {order}:")
+                        self.main_window[self.ml_key].print(f"Order with id {order}:")
                         for k, v in params:
-                            window['out'+sg.WRITE_ONLY_KEY].print(f"{k} ':' {v}")
+                            self.main_window[self.ml_key].print(f"{k} ':' {v}")
                 else:
-                    window['out'+sg.WRITE_ONLY_KEY].print("\nNo orders yet\n")
+                    self.main_window[self.ml_key].print("\nNo orders yet\n")
             elif event == "Balance":
-                window['out'+sg.WRITE_ONLY_KEY].print(f"\n{bot.get_account_data()}\n")
+                self.main_window[self.ml_key].print(f"\n{bot.get_account_data()}\n")
             else:
-                window['out'+sg.WRITE_ONLY_KEY].print(values)
+                self.main_window[self.ml_key].print(values)
         bot.socket_manager.close()
         bot.join(timeout=5)
-        window.close()
+        reactor.stop()
+        self.main_window.close()
+
+    @property
+    def ml_key(self):
+        return "out" + sg.WRITE_ONLY_KEY
 
     def popup_window(self, text, title, options):
         sg.theme(self.theme)
@@ -69,9 +76,7 @@ class Interface:
 
         for option, desc in self.options.items():
             self.layout.append([sg.Button(button_text=option), sg.Text(text=desc)])
-        multiline = sg.MLine(size=(105, 15), key="out"+sg.WRITE_ONLY_KEY)
-        multiline.reroute_stdout_to_here()
-        multiline.reroute_stderr_to_here()
+        multiline = sg.MLine(size=(105, 15), key=self.ml_key)
         self.layout.append([multiline])
 
         window = sg.Window(
@@ -82,4 +87,4 @@ class Interface:
             element_padding=(10, 10),
             auto_size_buttons=False,
         )
-        return window
+        self.main_window = window

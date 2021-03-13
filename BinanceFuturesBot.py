@@ -30,7 +30,7 @@ class BinanceTrader(Thread):
 
     KLINE_INTERVALS = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
 
-    def __init__(self, symbol: str, api_key: str, api_secret: str, window, test: bool, *args, **kwargs):
+    def __init__(self, symbol: str, api_key: str, api_secret: str, ui, test: bool, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.symbol = symbol
         self.ohlc = []
@@ -39,7 +39,8 @@ class BinanceTrader(Thread):
         self.long = False
         self.short = False
         self.time_offset = 500
-        self.window = window
+        self.precision = None
+        self.ui = ui
 
         self.api_key = api_key
         self.api_secret = api_secret
@@ -55,7 +56,7 @@ class BinanceTrader(Thread):
             sleep(1)
             utc_time = datetime.utcnow()
             if utc_time.minute % 5 == 0 and utc_time.second in range(0, 1):
-                self.window.write_event_value(
+                self.ui.main_window.write_event_value(
                     key="Klines",
                     value=f"Time: {datetime.utcnow()} - Close: {self.ohlc[3]} - High: {self.ohlc[1]} - "
                           f"Low: {self.ohlc[2]}"
@@ -104,7 +105,7 @@ class BinanceTrader(Thread):
 
     def get_exchange_info(self):
         """
-        Gets all symbols exchange info and returns minimum price change value
+        Gets all symbols exchange info and returns minimum price change value, sets up precision for price and qty
 
         :return: Decimal
         """
@@ -116,6 +117,7 @@ class BinanceTrader(Thread):
             return {'msg': exc}
         for symbol in data['symbols']:
             if symbol['symbol'] == self.symbol:
+                self.precision = [symbol['pricePrecision'], symbol['quantityPrecision']]
                 for filter_ in symbol['filters']:
                     if filter_['filterType'] == 'PRICE_FILTER':
                         ticksize = filter_['tickSize']
@@ -177,14 +179,21 @@ class BinanceTrader(Thread):
         additional = ['price', 'stopPrice', 'quantity']
         for param, value in params.items():
             if param in additional:
+                if param == 'quantity':
+                    precision = self.precision[1]
+                else:
+                    precision = self.precision[0]
                 context = decimal.Context()
                 context.prec = 12
-                new_decimal = context.create_decimal(repr(value))
-                params[param] = format(new_decimal, 'f')
+                new_decimal = round(context.create_decimal(repr(value)), precision)
+                params[param] = format(new_decimal, "f")
+        self.ui.main_window.write_event_value(key="Order", value=f"Placing order with params: {params}")
         try:
             self.client.futures_create_order(**params)
         except Exception as exc:
             log_warns.exception(exc)
+            self.ui.main_window.write_event_value(key="Order",
+                                                  value=f"Failed placing order {params['newClientOrderId']}")
             return {'msg': exc}
         self.orders[order_id] = params
         t = datetime.utcnow()
@@ -214,8 +223,7 @@ class BinanceTrader(Thread):
             if order['status'] == self.ORDER_STATUS_NEW:
                 pass
             elif order['status'] == self.ORDER_STATUS_FILLED or order['status'] == self.ORDER_STATUS_PARTIALLY_FILLED:
-                self.orders[order_id] = dict(status=order['status'], type=order['origType'], price=order['price'],
-                                             cumQty=order['cumQty'], side=order['side'])
+                self.orders[order_id] = dict(**order)
             elif order['status'] == self.ORDER_STATUS_REJECTED:
                 log.warning('ORDER REJECTED')
                 self.place_order(**self.orders[order_id])
@@ -269,15 +277,16 @@ def main():
     symbol = 'BTCUSDT'
     test = False
     ui = Interface()
-    window = ui.start_window()
+    ui.start_window()
     bot = BinanceTrader(
         symbol=symbol,
         test=test,
         api_key=API_KEY,
         api_secret=API_SECRET,
-        window=window
+        ui=ui,
+        daemon=True
     )
-    ui.run(bot=bot, window=window)
+    ui.run(bot=bot)
 
 
 if __name__ == '__main__':
