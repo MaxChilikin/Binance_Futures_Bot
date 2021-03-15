@@ -1,15 +1,49 @@
 import logging
 import os
 import re
+import pandas as pd
+import decimal
 from plotly import graph_objs as go
 from plotly.offline import plot
 
 
+class Order:
+
+    def __init__(self, params: dict, id_: str = None, long: bool = False, short: bool = False, time: str = None,
+                 failed: bool = False, db=None):
+        """
+
+        :param id_: orderId or newClientOrderId
+        :param params: parameters that will be sent to the server (or received from it)
+        :param long: True if order will change market position to long, False otherwise
+        :param short: True if order will change market position to short, False otherwise
+        :param time: departure time in UTC
+        :param db: DataBase
+        """
+        self.id = id_
+        self.params = params
+        self.long = long
+        self.short = short
+        self.time = time
+        self.failed = failed
+        self.status = "NEW"
+        self.db = db
+
+    def to_db(self):
+        self.db.create(id=self.id, params=self.params, long=self.long, short=self.short, time=self.time,
+                       failed=self.failed, status=self.status)
+
+    def update(self, **kwargs):
+        self.db.update(kwargs).where(self.db.id == self.id).execute()
+
+    def delete(self):
+        to_del = self.db.get(self.db.id == self.id)
+        to_del.delete_instance()
+
+
 def configure_logging():
-    log = logging.getLogger('info')
-    log.setLevel(level='INFO')
-    log_2 = logging.getLogger('warns')
-    log_2.setLevel(level='WARNING')
+    log = logging.getLogger('warns')
+    log.setLevel(level='WARNING')
 
     file_path = os.path.join(os.path.dirname(__file__), 'botwarns.log')
     file_handler = logging.FileHandler(
@@ -22,21 +56,9 @@ def configure_logging():
         datefmt='%Y-%m-%d %H:%M'
     ))
     file_handler.setLevel(level='WARNING')
-    log_2.addHandler(file_handler)
+    log.addHandler(file_handler)
 
-    file_path = os.path.join(os.path.dirname(__file__), 'orders.log')
-    file_handler_2 = logging.FileHandler(
-        filename=file_path,
-        mode='a',
-        encoding='utf8',
-    )
-    file_handler_2.setFormatter(logging.Formatter(
-        fmt='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M'
-    ))
-    file_handler_2.setLevel(level='INFO')
-    log.addHandler(file_handler_2)
-    return log, log_2
+    return log
 
 
 def get_interval(interval):
@@ -44,6 +66,24 @@ def get_interval(interval):
     result = re.match(checker, interval)
     int_interval = [int(result[1]), result[2]]
     return int_interval
+
+
+def to_dataframe(data):
+    df = pd.DataFrame.from_records(data)
+    df = df.drop(range(5, 12), axis=1)
+    col_names = ['time', 'open', 'high', 'low', 'close']
+    df.columns = col_names
+    for col in col_names:
+        df[col] = df[col].astype(float)
+    df['date'] = pd.to_datetime(df['time'] * 1000000, infer_datetime_format=True)
+    return df
+
+
+def to_string(value, precision):
+    context = decimal.Context()
+    context.prec = 12
+    new_value = round(context.create_decimal(repr(value)), precision)
+    return format(new_value, "f")
 
 
 def plot_data(df, symbol, graphs=None):

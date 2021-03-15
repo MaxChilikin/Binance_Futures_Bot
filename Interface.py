@@ -29,25 +29,29 @@ class Interface:
                 )
                 pop_event, pop_value = popup.read()
                 if pop_event == "Yes":
-                    for order_id, order in bot.orders.items():
-                        bot.close_order(order_id=order_id)
+                    bot.close_orders()
                 elif pop_event == "No":
                     pass
                 popup.close()
                 break
             elif event == "Orders":
-                if bot.orders:
-                    for order, params in bot.orders:
-                        self.main_window[self.ml_key].print(f"Order with id {order}:")
-                        for k, v in params:
-                            self.main_window[self.ml_key].print(f"{k} ':' {v}")
+                orders = bot.orders.select()
+                if orders:
+                    self.main_window[self.ml_key].print("")
+                    for order in orders:
+                        order_params = dict(time=order.time, status=order.status, params=order.params,
+                                            failed=order.failed, long=order.long, short=order.short)
+                        for key, value in order_params.items():
+                            self.main_window[self.ml_key].print(f"{key}: {value}")
+                        self.main_window[self.ml_key].print("")
                 else:
                     self.main_window[self.ml_key].print("\nNo orders yet\n")
             elif event == "Balance":
-                self.main_window[self.ml_key].print(f"\n{bot.get_account_data()}\n")
+                self.main_window[self.ml_key].print(f"\n{bot.balance}\n")
             else:
                 self.main_window[self.ml_key].print(values)
         bot.socket_manager.close()
+        bot.user_socket_manager.close()
         bot.join(timeout=5)
         reactor.stop()
         self.main_window.close()

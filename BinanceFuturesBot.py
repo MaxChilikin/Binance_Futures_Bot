@@ -1,22 +1,21 @@
 from binance.client import Client
-import pandas as pd
-import decimal
 from time import time, sleep
 from binance.websockets import BinanceSocketManager
 from datetime import datetime
-from strategy import strategy, stoploss
-from utils import configure_logging
+from strategy import Strategy
+from utils import Order, configure_logging, to_string
 from uuid import uuid1
 from threading import Thread
 from sys import exit
 from Interface import Interface
+from Models import Orders
 try:
     from credentials import API_KEY, API_SECRET
 except ImportError:
     API_KEY = API_SECRET = None
     exit("CAN'T RUN BOT WITHOUT API_KEY, API_SECRET FROM CREDENTIALS.PY")
 
-log, log_warns = configure_logging()[0], configure_logging()[1]
+log_warns = configure_logging()
 
 
 class BinanceTrader(Thread):
@@ -30,11 +29,14 @@ class BinanceTrader(Thread):
 
     KLINE_INTERVALS = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
 
-    def __init__(self, symbol: str, api_key: str, api_secret: str, ui, test: bool, *args, **kwargs):
+    def __init__(self, symbol: str, interval: str, leverage: int, api_key: str, api_secret: str, ui, test: bool,
+                 *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.symbol = symbol
+        self.interval = interval
+        self.leverage = leverage
+        self.balance = {}
         self.ohlc = []
-        self.orders = {}
         self.test = test
         self.long = False
         self.short = False
@@ -42,42 +44,66 @@ class BinanceTrader(Thread):
         self.precision = None
         self.ui = ui
 
+        self.orders = Orders
         self.api_key = api_key
         self.api_secret = api_secret
         self.client = Client(self.api_key, self.api_secret)
-        self.socket_manager = BinanceSocketManager(client=self.client, user_timeout=60)
+        self.socket_manager, self.user_socket_manager = None, None
+        self.kline_socket_key, self.user_socket_key = None, None
 
     def run(self):
         ticksize = self.get_exchange_info()
-        self.socket_manager.start_kline_socket(symbol=self.symbol, callback=self.callback)
-        self.socket_manager.start()
+        klines = self.get_klines(interval=self.interval)
+        self.get_account_data()
+        strategy = Strategy(klines=klines, symbol=self.symbol, leverage=self.leverage, quantity=self.get_quantity)
+        self.start_streams()
         sleep(5)
         while True:
-            sleep(1)
+            sleep(0.25)
             utc_time = datetime.utcnow()
-            if utc_time.minute % 5 == 0 and utc_time.second in range(0, 1):
+            time_check = strategy.timer(time=utc_time)
+            if time_check:
                 self.ui.main_window.write_event_value(
                     key="Klines",
-                    value=f"Time: {datetime.utcnow()} - Close: {self.ohlc[3]} - High: {self.ohlc[1]} - "
-                          f"Low: {self.ohlc[2]}"
+                    value=f"Time: {datetime.utcnow()} - Close: {self.ohlc[4]} - High: {self.ohlc[2]} - "
+                          f"Low: {self.ohlc[3]}"
                 )
                 sleep(2)
-                signals, self.long, self.short = strategy(
-                    symbol=self.symbol, klines=self.get_klines, on_long=self.long, on_short=self.short,
-                    quantity=self.get_quantity
-                )
+                signals = strategy.check(on_long=self.long, on_short=self.short, ohlc=self.ohlc)
                 if signals:
                     for signal in signals:
-                        self.place_order(**signal, test=self.test)
-            sl, self.long, self.short = stoploss(ohlc=self.ohlc, ticksize=ticksize, symbol=self.symbol,
-                                                 on_long=self.long, on_short=self.short, quantity=self.get_quantity)
+                        self.place_order(order=signal, test=self.test)
+            sl = strategy.stoploss(ohlc=self.ohlc, ticksize=ticksize, on_long=self.long, on_short=self.short)
             if sl:
-                self.place_order(**sl, test=self.test)
-            if self.orders:
-                if utc_time.minute % 10 == 0 and utc_time.second in range(0, 1):
-                    sleep(2)
-                    for order_id, order in self.orders.items():
-                        self.check_order(order_id=order_id)
+                self.place_order(order=sl, test=self.test)
+
+    def start_streams(self):
+        try:
+            self.socket_manager = BinanceSocketManager(client=self.client, user_timeout=60)
+            self.user_socket_manager = BinanceSocketManager(client=self.client, user_timeout=60)
+            self.kline_socket_key = self.socket_manager.start_kline_socket(symbol=self.symbol, interval=self.interval,
+                                                                           callback=self.callback)
+            self.user_socket_key = self.user_socket_manager.start_user_socket(callback=self.user_data_callback)
+            if self.kline_socket_key and self.user_socket_key:
+                self.socket_manager.start()
+                self.user_socket_manager.start()
+            else:
+                raise ConnectionError(f"One of the following keys is missing: User socket key {self.user_socket_key},"
+                                      f" Klines socket key {self.kline_socket_key}")
+        except Exception as exc:
+            log_warns.exception(exc)
+            return {'msg': exc}
+
+    def restart_stream(self, socket_key, manager):
+        try:
+            manager.stop_socket(conn_key=socket_key)
+        except Exception as exc:
+            log_warns.exception(exc)
+        if socket_key == self.user_socket_key:
+            self.user_socket_key = self.user_socket_manager.start_user_socket(callback=self.user_data_callback)
+        elif socket_key == self.kline_socket_key:
+            self.kline_socket_key = self.socket_manager.start_kline_socket(symbol=self.symbol, interval=self.interval,
+                                                                           callback=self.callback)
 
     def get_klines(self, interval: str, limit: int = 500):
         """
@@ -85,7 +111,7 @@ class BinanceTrader(Thread):
 
         :param interval: constant from KLINE_INTERVALS list
         :param limit: required amount of klines
-        :return: pd.DataFrame obj.
+        :return: list(list(ohlc_values), ..)
         """
         try:
             data = self.client.futures_klines(symbol=self.symbol,
@@ -94,14 +120,7 @@ class BinanceTrader(Thread):
         except Exception as exc:
             log_warns.exception(exc)
             return {'msg': exc}
-        df = pd.DataFrame.from_records(data)
-        df = df.drop(range(5, 12), axis=1)
-        col_names = ['time', 'open', 'high', 'low', 'close']
-        df.columns = col_names
-        for col in col_names:
-            df[col] = df[col].astype(float)
-        df['date'] = pd.to_datetime(df['time'] * 1000000, infer_datetime_format=True)
-        return df
+        return data
 
     def get_exchange_info(self):
         """
@@ -138,7 +157,7 @@ class BinanceTrader(Thread):
             return {'msg': exc}
         for asset in balance:
             account_balance[asset['asset']] = asset['balance']
-        return account_balance
+        self.balance = account_balance
 
     def get_quantity(self, leverage: int):
         """
@@ -148,14 +167,14 @@ class BinanceTrader(Thread):
         :return: float
         """
         if self.ohlc:
-            balance = self.get_account_data()
-            close = self.ohlc[3]
-            quantity = (leverage + 1) * float(balance['USDT']) / float(close)
+            balance = self.balance['USDT']
+            close = self.ohlc[4]
+            quantity = (leverage + 1) * float(balance) / float(close)
         else:
             quantity = 0.0
         return quantity
 
-    def place_order(self, **kwargs):
+    def place_order(self, order: Order, **kwargs):
         """
         Places an order with mandatory parameters:
         symbol str: trading symbol
@@ -167,12 +186,14 @@ class BinanceTrader(Thread):
                     STOP_MARKET/TAKE_PROFIT_MARKET | stopPrice
                     TRAILING_STOP_MARKET	       | callbackRate
         """
-        order_id = str(uuid1())
+        order.id, order.db = str(uuid1()), self.orders
+
         params = dict(
+            **order.params,
             **kwargs,
             recvWindow=5000,
             timestamp=int(round(time()) * 1000) + self.time_offset,
-            newClientOrderId=order_id,
+            newClientOrderId=order.id,
         )
         if type == 'LIMIT':
             params['timeInForce'] = 'GTC'
@@ -183,27 +204,27 @@ class BinanceTrader(Thread):
                     precision = self.precision[1]
                 else:
                     precision = self.precision[0]
-                context = decimal.Context()
-                context.prec = 12
-                new_decimal = round(context.create_decimal(repr(value)), precision)
-                params[param] = format(new_decimal, "f")
+                params[param] = to_string(value=value, precision=precision)
+        order.params = params
+        order.time = datetime.utcnow()
+
         self.ui.main_window.write_event_value(key="Order", value=f"Placing order with params: {params}")
         try:
             self.client.futures_create_order(**params)
         except Exception as exc:
             log_warns.exception(exc)
-            self.ui.main_window.write_event_value(key="Order",
-                                                  value=f"Failed placing order {params['newClientOrderId']}")
+            order.failed = True
+            order.to_db()
+            self.ui.main_window.write_event_value(key="Order", value=f"Failed placing order {order.id}")
             return {'msg': exc}
-        self.orders[order_id] = params
-        t = datetime.utcnow()
-        log.info(f"Order with id: %s , params %s , placed time: %s ", order_id, kwargs, t)
 
-    def close_order(self, order_id):
+        self.long, self.short = order.long, order.short
+        order.to_db()
+
+    def close_orders(self):
         try:
-            self.client.futures_cancel_order(
+            self.client.futures_cancel_all_open_orders(
                 symbol=self.symbol,
-                origClientOrderId=order_id,
                 timestamp=int(round(time()) * 1000) + self.time_offset,
                 recvWindow=5000
             )
@@ -211,75 +232,84 @@ class BinanceTrader(Thread):
             log_warns.exception('Order cancel failed %s ', exc)
             return {'msg': exc}
 
-    def check_order(self, order_id):
+    def order_update(self, response):
         """
         Gets order status from server and repeats it if rejected
         """
         try:
-            order = self.client.futures_get_order(symbol=self.symbol,
-                                                  origClientOrderId=order_id,
-                                                  timestamp=int(round(time()) * 1000) + self.time_offset,
-                                                  recvWindow=5000)
-            if order['status'] == self.ORDER_STATUS_NEW:
-                pass
-            elif order['status'] == self.ORDER_STATUS_FILLED or order['status'] == self.ORDER_STATUS_PARTIALLY_FILLED:
-                self.orders[order_id] = dict(**order)
-            elif order['status'] == self.ORDER_STATUS_REJECTED:
-                log.warning('ORDER REJECTED')
-                self.place_order(**self.orders[order_id])
-                del self.orders[order_id]
-            elif order['status'] == self.ORDER_STATUS_CANCELED or order['status'] == self.ORDER_STATUS_EXPIRED:
-                log.warning('ORDER CANCELED/EXPIRED')
-                del self.orders[order_id]
-            log.info(f"Check order with id: %s , params: %s ", order_id, order)
+            order = self.orders.get(self.orders.id == response['c'])
         except Exception as exc:
             log_warns.exception(exc)
             return {'msg': exc}
+        if response['X'] == self.ORDER_STATUS_NEW:
+            return
+        else:
+            order.status = response['X']
+        if order.status == self.ORDER_STATUS_FILLED or order.status == self.ORDER_STATUS_PARTIALLY_FILLED:
+            order.update(params=response, status=order.status)
+        elif order.status == self.ORDER_STATUS_REJECTED:
+            order.update(params=response, status=order.status)
+        elif order.status == self.ORDER_STATUS_CANCELED or order.status == self.ORDER_STATUS_EXPIRED:
+            order.delete()
 
     def check_profit_loss(self):
         """
         Counts profit/loss based of filled/partially filled orders
 
-        :return: Decimal
+        :return: float
         """
         bought = 0
         sold = 0
-        for order in self.orders.values():
-            if order['status'] and order['status'] == self.ORDER_STATUS_FILLED or order['status'] == self.ORDER_STATUS_PARTIALLY_FILLED:
-                if order['side'] == 'BUY':
-                    bought = order['price'] * order['cumQty']
-                if order['side'] == 'SELL':
-                    sold = order['price'] * order['cumQty']
-        profits = decimal.Decimal(sold - bought)
-        return profits
-
-    def save_orders(self):
-        """
-        Saves all unfilled orders
-
-        :return: dict(order_id=dict(**order_parameters))
-        """
-        orders = {}
-        for id_, order in self.orders.items():
-            if not order['status']:
-                orders.setdefault(id_, order)
-        return orders
+        all_orders = self.orders.select()
+        if all_orders:
+            for order in self.orders.select():
+                if order.params['status'] and order.params['status'] == self.ORDER_STATUS_FILLED or \
+                   order.params['status'] == self.ORDER_STATUS_PARTIALLY_FILLED:
+                    if order.params['side'] == 'BUY':
+                        bought += float(order.params['price']) * float(order.params['executedQty'])
+                    if order.params['side'] == 'SELL':
+                        sold += float(order.params['price']) * float(order.params['executedQty'])
+            profits = sold - bought
+            return round(profits, 2)
 
     def callback(self, msg):
         """
-        Handles messages from websocket
+        Handles messages from kline/candlestick websocket
         """
         kline_info = msg['k']
-        self.ohlc = [kline_info['o'], kline_info['h'], kline_info['l'], kline_info['c']]
+        self.ohlc = [kline_info['t'], kline_info['o'], kline_info['h'], kline_info['l'], kline_info['c']]
+
+    def user_data_callback(self, msg):
+        """
+        Handles messages from user data websocket
+        """
+        event_type = msg['e']
+        self.ui.main_window.write_event_value(key="User_stream", value=event_type)
+        if event_type == "listenKeyExpired":
+            self.restart_stream(socket_key=self.user_socket_key, manager=self.user_socket_manager)
+        elif event_type == "MARGIN_CALL":
+            # TODO DO SOMETHING? pre-liquidation event
+            pass
+        elif event_type == "ACCOUNT_UPDATE":
+            update_data = msg['a']
+            balance = update_data['B']
+            self.ui.main_window.write_event_value(key="Balance", value=balance)
+            for asset in balance:
+                self.balance[asset['a']] = asset["wb"]
+        elif event_type == "ORDER_TRADE_UPDATE":
+            order_info = msg['o']
+            self.ui.main_window.write_event_value(key="Order", value=order_info)
+            self.order_update(response=order_info)
 
 
 def main():
-    symbol = 'BTCUSDT'
-    test = False
+    symbol, interval, leverage, test = 'BTCUSDT', '5m', 7, False
     ui = Interface()
     ui.start_window()
     bot = BinanceTrader(
         symbol=symbol,
+        interval=interval,
+        leverage=leverage,
         test=test,
         api_key=API_KEY,
         api_secret=API_SECRET,
