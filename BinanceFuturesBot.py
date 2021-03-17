@@ -9,6 +9,7 @@ from threading import Thread
 from sys import exit
 from Interface import Interface
 from Models import Orders
+from decimal import Decimal
 try:
     from credentials import API_KEY, API_SECRET
 except ImportError:
@@ -76,6 +77,25 @@ class BinanceTrader(Thread):
             sl = strategy.stoploss(ohlc=self.ohlc, ticksize=ticksize, on_long=self.long, on_short=self.short)
             if sl:
                 self.place_order(order=sl, test=self.test)
+            if utc_time.minute % 50 == 0 and utc_time.second == 0:
+                self.tackle()
+
+    def tackle(self):
+        """ Checks streams """
+        import requests
+        import json
+        url = 'https://api.binance.com/api/v3/userDataStream'
+        headers = {"X-MBX-APIKEY": self.api_key}
+        params = {"listenKey": self.user_socket_key}
+        try:
+            response = requests.put(url, params=params, headers=headers)
+            data = json.loads(response.text)
+            data['url'] = url
+        except Exception as exc:
+            data = {'code': '-1', 'url': url, 'msg': exc}
+        self.ui.main_window.write_event_value(key="user_stream_check", value=data)
+        kline_stream_check = self.socket_manager.is_alive()
+        self.ui.main_window.write_event_value(key="kline_stream_check", value=kline_stream_check)
 
     def start_streams(self):
         try:
@@ -167,9 +187,14 @@ class BinanceTrader(Thread):
         :return: float
         """
         if self.ohlc:
-            balance = self.balance['USDT']
-            close = self.ohlc[4]
-            quantity = (leverage + 1) * float(balance) / float(close)
+            # TODO MORE CONVENIENT? >
+            main_asset = Decimal(self.balance['USDT'])
+            coin = round(Decimal(self.balance['BAT']), self.precision[1])
+            close = Decimal(self.ohlc[4])
+            if coin and coin > 0.0:
+                quantity = coin
+            else:
+                quantity = (leverage + 1) * main_asset / close
         else:
             quantity = 0.0
         return quantity
@@ -237,7 +262,7 @@ class BinanceTrader(Thread):
         Gets order status from server and repeats it if rejected
         """
         try:
-            order = self.orders.get(self.orders.id == response['c'])
+            order = self.orders.get(self.orders.id == response['C'])
         except Exception as exc:
             log_warns.exception(exc)
             return {'msg': exc}
@@ -284,26 +309,31 @@ class BinanceTrader(Thread):
         Handles messages from user data websocket
         """
         event_type = msg['e']
-        self.ui.main_window.write_event_value(key="User_stream", value=event_type)
+        self.ui.main_window.write_event_value(key="User_stream", value=msg)
         if event_type == "listenKeyExpired":
             self.restart_stream(socket_key=self.user_socket_key, manager=self.user_socket_manager)
+        elif event_type == "balanceUpdate":
+            updated_asset = msg['a']
+            self.balance[updated_asset] = Decimal(self.balance[updated_asset]) - Decimal(msg['d'])
+        elif event_type == "outboundAccountPosition":
+            balances_array = msg['B']  # list with dicts
+            #   "B": [                          //Balances Array
+            #     {
+            #       "a": "ETH",                 //Asset
+            #       "f": "10000.000000",        //Free
+            #       "l": "0.000000"             //Locked
+            #     }
+            #   ]
         elif event_type == "MARGIN_CALL":
             # TODO DO SOMETHING? pre-liquidation event
             pass
-        elif event_type == "ACCOUNT_UPDATE":
-            update_data = msg['a']
-            balance = update_data['B']
-            self.ui.main_window.write_event_value(key="Balance", value=balance)
-            for asset in balance:
-                self.balance[asset['a']] = asset["wb"]
-        elif event_type == "ORDER_TRADE_UPDATE":
-            order_info = msg['o']
-            self.ui.main_window.write_event_value(key="Order", value=order_info)
-            self.order_update(response=order_info)
+        elif event_type == "executionReport":
+            # TODO WORK WITH IT IF "balanceUpdate" AND "outboundAccountPosition" ARE GARBO
+            self.order_update(response=msg)
 
 
 def main():
-    symbol, interval, leverage, test = 'BTCUSDT', '5m', 7, False
+    symbol, interval, leverage, test = 'BATUSDT', '5m', 7, False
     ui = Interface()
     ui.start_window()
     bot = BinanceTrader(
