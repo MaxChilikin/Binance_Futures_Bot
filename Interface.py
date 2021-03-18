@@ -9,8 +9,9 @@ class Interface:
         self.theme = 'DarkAmber'
         self.options = {
             "Stop": "Close all connections and terminate bot",
-            "Orders": "Show all session trade orders and their parameters",
+            "Orders": "Show trade orders and their parameters",
             "Balance": "Show amount of every asset on account",
+            "Account info": "Show all information about account (uses request weight)",
         }
         self.layout = list()
         self.main_window = None
@@ -23,13 +24,13 @@ class Interface:
                 break
             elif event == "Stop":
                 popup = self.popup_window(
-                    text="Want close opened orders?",
+                    text="Want to close all positions?",
                     title="Bot",
                     options=["Yes", "No"]
                 )
                 pop_event, pop_value = popup.read()
                 if pop_event == "Yes":
-                    bot.close_orders()
+                    bot.close_positions()
                 elif pop_event == "No":
                     pass
                 popup.close()
@@ -48,10 +49,15 @@ class Interface:
                     self.main_window[self.ml_key].print("\nNo orders yet\n")
             elif event == "Balance":
                 self.main_window[self.ml_key].print(f"\n{bot.balance}\n")
+            elif event == "Account info":
+                info_dict = bot.get_account_information()
+                self.main_window[self.ml_key].print("")
+                for k, v in info_dict.items():
+                    self.main_window[self.ml_key].print(f"{k}: {v}")
+                self.main_window[self.ml_key].print("")
             else:
                 self.main_window[self.ml_key].print(values)
         bot.socket_manager.close()
-        bot.user_socket_manager.close()
         bot.join(timeout=5)
         reactor.stop()
         self.main_window.close()
@@ -87,7 +93,7 @@ class Interface:
             title=self.title,
             layout=self.layout,
             default_button_element_size=(10, 2),
-            size=(800, 500),
+            size=(800, 550),
             element_padding=(10, 10),
             auto_size_buttons=False,
         )

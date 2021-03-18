@@ -38,26 +38,24 @@ class BinanceTrader(Thread):
         self.leverage = leverage
         self.balance = {}
         self.ohlc = []
-        self.test = test
-        self.long = False
-        self.short = False
+        self.long, self.short = False, False
         self.time_offset = 500
         self.precision = None
         self.ui = ui
+        self.test = test
 
         self.orders = Orders
         self.api_key = api_key
         self.api_secret = api_secret
         self.client = Client(self.api_key, self.api_secret)
-        self.socket_manager, self.user_socket_manager = None, None
-        self.kline_socket_key, self.user_socket_key = None, None
+        self.socket_manager, self.kline_socket_key = None, None
 
     def run(self):
         ticksize = self.get_exchange_info()
         klines = self.get_klines(interval=self.interval)
-        self.get_account_data()
+        self.get_account_balance()
         strategy = Strategy(klines=klines, symbol=self.symbol, leverage=self.leverage, quantity=self.get_quantity)
-        self.start_streams()
+        self.start_stream()
         sleep(5)
         while True:
             sleep(0.25)
@@ -77,39 +75,25 @@ class BinanceTrader(Thread):
             sl = strategy.stoploss(ohlc=self.ohlc, ticksize=ticksize, on_long=self.long, on_short=self.short)
             if sl:
                 self.place_order(order=sl, test=self.test)
-            if utc_time.minute % 50 == 0 and utc_time.second == 0:
-                self.tackle()
 
     def tackle(self):
-        """ Checks streams """
-        import requests
-        import json
-        url = 'https://api.binance.com/api/v3/userDataStream'
-        headers = {"X-MBX-APIKEY": self.api_key}
-        params = {"listenKey": self.user_socket_key}
-        try:
-            response = requests.put(url, params=params, headers=headers)
-            data = json.loads(response.text)
-            data['url'] = url
-        except Exception as exc:
-            data = {'code': '-1', 'url': url, 'msg': exc}
-        self.ui.main_window.write_event_value(key="user_stream_check", value=data)
+        """ Checks stream """
         kline_stream_check = self.socket_manager.is_alive()
-        self.ui.main_window.write_event_value(key="kline_stream_check", value=kline_stream_check)
+        if kline_stream_check:
+            msg = "Alive"
+        else:
+            msg = "Down"
+        self.ui.main_window.write_event_value(key="kline_stream_check", value=msg)
 
-    def start_streams(self):
+    def start_stream(self):
         try:
             self.socket_manager = BinanceSocketManager(client=self.client, user_timeout=60)
-            self.user_socket_manager = BinanceSocketManager(client=self.client, user_timeout=60)
             self.kline_socket_key = self.socket_manager.start_kline_socket(symbol=self.symbol, interval=self.interval,
                                                                            callback=self.callback)
-            self.user_socket_key = self.user_socket_manager.start_user_socket(callback=self.user_data_callback)
-            if self.kline_socket_key and self.user_socket_key:
+            if self.kline_socket_key:
                 self.socket_manager.start()
-                self.user_socket_manager.start()
             else:
-                raise ConnectionError(f"One of the following keys is missing: User socket key {self.user_socket_key},"
-                                      f" Klines socket key {self.kline_socket_key}")
+                raise ConnectionError(f"Kline key is missing: {self.kline_socket_key}")
         except Exception as exc:
             log_warns.exception(exc)
             return {'msg': exc}
@@ -119,11 +103,8 @@ class BinanceTrader(Thread):
             manager.stop_socket(conn_key=socket_key)
         except Exception as exc:
             log_warns.exception(exc)
-        if socket_key == self.user_socket_key:
-            self.user_socket_key = self.user_socket_manager.start_user_socket(callback=self.user_data_callback)
-        elif socket_key == self.kline_socket_key:
-            self.kline_socket_key = self.socket_manager.start_kline_socket(symbol=self.symbol, interval=self.interval,
-                                                                           callback=self.callback)
+        self.kline_socket_key = self.socket_manager.start_kline_socket(symbol=self.symbol, interval=self.interval,
+                                                                       callback=self.callback)
 
     def get_klines(self, interval: str, limit: int = 500):
         """
@@ -162,7 +143,32 @@ class BinanceTrader(Thread):
                         ticksize = filter_['tickSize']
         return ticksize
 
-    def get_account_data(self):
+    def get_account_information(self):
+        """
+        Gets account information, including balance and position
+        """
+        try:
+            info = self.client.futures_account(timestamp=int(round(time()) * 1000) + self.time_offset,
+                                               recvWindow=5000)
+        except Exception as exc:
+            log_warns.exception(exc)
+            return {'msg': exc}
+        sorted_info = {}
+        for key, value in info.items():
+            if key == 'assets':
+                for asset in info[key]:
+                    if Decimal(asset['walletBalance']) > 0:
+                        sorted_info[asset['asset']] = asset
+                        self.balance[asset['asset']] = asset['walletBalance']
+            elif key == 'positions':
+                for pos in info[key]:
+                    if Decimal(pos['positionAmt']) > 0 or Decimal(pos['positionAmt']) < 0:
+                        sorted_info[pos['symbol']] = pos
+            else:
+                sorted_info.setdefault(key, value)
+        return sorted_info
+
+    def get_account_balance(self):
         """
         Gets balance for every asset
 
@@ -178,6 +184,7 @@ class BinanceTrader(Thread):
         for asset in balance:
             account_balance[asset['asset']] = asset['balance']
         self.balance = account_balance
+        return balance
 
     def get_quantity(self, leverage: int):
         """
@@ -187,14 +194,10 @@ class BinanceTrader(Thread):
         :return: float
         """
         if self.ohlc:
-            # TODO MORE CONVENIENT? >
-            main_asset = Decimal(self.balance['USDT'])
-            coin = round(Decimal(self.balance['BAT']), self.precision[1])
-            close = Decimal(self.ohlc[4])
-            if coin and coin > 0.0:
-                quantity = coin
-            else:
-                quantity = (leverage + 1) * main_asset / close
+            self.get_account_balance()
+            main_asset = float(self.balance['USDT'])
+            close = float(self.ohlc[4])
+            quantity = (leverage + 1) * main_asset / close
         else:
             quantity = 0.0
         return quantity
@@ -222,7 +225,7 @@ class BinanceTrader(Thread):
         )
         if type == 'LIMIT':
             params['timeInForce'] = 'GTC'
-        additional = ['price', 'stopPrice', 'quantity']
+        additional = ['price', 'stopPrice', 'activationPrice', 'quantity']
         for param, value in params.items():
             if param in additional:
                 if param == 'quantity':
@@ -245,6 +248,36 @@ class BinanceTrader(Thread):
 
         self.long, self.short = order.long, order.short
         order.to_db()
+
+    def close_positions(self):
+        try:
+            positions = self.client.futures_position_information(
+                symbol=self.symbol,
+                timestamp=int(round(time()) * 1000) + self.time_offset,
+                recvWindow=5000
+            )
+        except Exception as exc:
+            log_warns.exception('Position info pull failed %s ', exc)
+            return {'msg': exc}
+        for position in positions:
+            pos_quantity = Decimal(position["positionAmt"])
+            if pos_quantity > 0:
+                side = "SELL"
+            elif pos_quantity < 0:
+                side = "BUY"
+            else:
+                continue
+            order = Order(
+                params=dict(
+                    side=side,
+                    type='MARKET',
+                    symbol=self.symbol,
+                    quantity=position["positionAmt"]
+                ),
+                long=False,
+                short=False
+            )
+            self.place_order(order=order)
 
     def close_orders(self):
         try:
@@ -304,36 +337,9 @@ class BinanceTrader(Thread):
         kline_info = msg['k']
         self.ohlc = [kline_info['t'], kline_info['o'], kline_info['h'], kline_info['l'], kline_info['c']]
 
-    def user_data_callback(self, msg):
-        """
-        Handles messages from user data websocket
-        """
-        event_type = msg['e']
-        self.ui.main_window.write_event_value(key="User_stream", value=msg)
-        if event_type == "listenKeyExpired":
-            self.restart_stream(socket_key=self.user_socket_key, manager=self.user_socket_manager)
-        elif event_type == "balanceUpdate":
-            updated_asset = msg['a']
-            self.balance[updated_asset] = Decimal(self.balance[updated_asset]) - Decimal(msg['d'])
-        elif event_type == "outboundAccountPosition":
-            balances_array = msg['B']  # list with dicts
-            #   "B": [                          //Balances Array
-            #     {
-            #       "a": "ETH",                 //Asset
-            #       "f": "10000.000000",        //Free
-            #       "l": "0.000000"             //Locked
-            #     }
-            #   ]
-        elif event_type == "MARGIN_CALL":
-            # TODO DO SOMETHING? pre-liquidation event
-            pass
-        elif event_type == "executionReport":
-            # TODO WORK WITH IT IF "balanceUpdate" AND "outboundAccountPosition" ARE GARBO
-            self.order_update(response=msg)
-
 
 def main():
-    symbol, interval, leverage, test = 'BATUSDT', '5m', 7, False
+    symbol, interval, leverage, test = 'BTCUSDT', '5m', 7, False
     ui = Interface()
     ui.start_window()
     bot = BinanceTrader(
