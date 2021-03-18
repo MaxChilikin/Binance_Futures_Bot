@@ -51,16 +51,18 @@ class BinanceTrader(Thread):
         self.socket_manager, self.kline_socket_key = None, None
 
     def run(self):
-        ticksize = self.get_exchange_info()
+        self.get_exchange_info()
         klines = self.get_klines(interval=self.interval)
         self.get_account_balance()
-        strategy = Strategy(klines=klines, symbol=self.symbol, leverage=self.leverage, quantity=self.get_quantity)
-        self.start_stream()
+        strategy = Strategy(
+            klines=klines, symbol=self.symbol, leverage=self.leverage, quantity=self.get_quantity,
+            check_order=self.check_order, close_order=self.close_order, acc_info=self.get_account_information,
+        )
+        self.start_kline_stream()
         sleep(5)
         while True:
             sleep(0.25)
-            utc_time = datetime.utcnow()
-            time_check = strategy.timer(time=utc_time)
+            time_check = strategy.timer()
             if time_check:
                 self.ui.main_window.write_event_value(
                     key="Klines",
@@ -72,20 +74,11 @@ class BinanceTrader(Thread):
                 if signals:
                     for signal in signals:
                         self.place_order(order=signal, test=self.test)
-            sl = strategy.stoploss(ohlc=self.ohlc, ticksize=ticksize, on_long=self.long, on_short=self.short)
+            sl = strategy.stoploss(ohlc=self.ohlc, on_long=self.long, on_short=self.short)
             if sl:
                 self.place_order(order=sl, test=self.test)
 
-    def tackle(self):
-        """ Checks stream """
-        kline_stream_check = self.socket_manager.is_alive()
-        if kline_stream_check:
-            msg = "Alive"
-        else:
-            msg = "Down"
-        self.ui.main_window.write_event_value(key="kline_stream_check", value=msg)
-
-    def start_stream(self):
+    def start_kline_stream(self):
         try:
             self.socket_manager = BinanceSocketManager(client=self.client, user_timeout=60)
             self.kline_socket_key = self.socket_manager.start_kline_socket(symbol=self.symbol, interval=self.interval,
@@ -98,13 +91,28 @@ class BinanceTrader(Thread):
             log_warns.exception(exc)
             return {'msg': exc}
 
-    def restart_stream(self, socket_key, manager):
+    def restart_stream(self, manager, socket_key):
         try:
             manager.stop_socket(conn_key=socket_key)
         except Exception as exc:
             log_warns.exception(exc)
-        self.kline_socket_key = self.socket_manager.start_kline_socket(symbol=self.symbol, interval=self.interval,
-                                                                       callback=self.callback)
+        if socket_key == self.kline_socket_key:
+            self.kline_socket_key = self.socket_manager.start_kline_socket(symbol=self.symbol, interval=self.interval,
+                                                                           callback=self.callback)
+
+    def check_order(self, order: Order):
+        try:
+            order_info = self.client.futures_get_order(
+                symbol=self.symbol,
+                timestamp=int(round(time()) * 1000) + self.time_offset,
+                recvWindow=5000,
+                origClientOrderId=order.id,
+            )
+        except Exception as exc:
+            log_warns.exception(exc)
+            return "Order does not exist"
+        order.update(params=order_info)
+        return order_info
 
     def get_klines(self, interval: str, limit: int = 500):
         """
@@ -146,6 +154,8 @@ class BinanceTrader(Thread):
     def get_account_information(self):
         """
         Gets account information, including balance and position
+
+        :rtype: dict
         """
         try:
             info = self.client.futures_account(timestamp=int(round(time()) * 1000) + self.time_offset,
@@ -186,20 +196,26 @@ class BinanceTrader(Thread):
         self.balance = account_balance
         return balance
 
-    def get_quantity(self, leverage: int):
+    def get_quantity(self, leverage: int, open_position: bool = True):
         """
         Counts quantity using required leverage and account balance
 
         :param leverage: leverage to trade with
+        :param open_position: True if order will open position, False otherwise
         :return: float
         """
+        quantity = 0.0
         if self.ohlc:
-            self.get_account_balance()
-            main_asset = float(self.balance['USDT'])
-            close = float(self.ohlc[4])
-            quantity = (leverage + 1) * main_asset / close
-        else:
-            quantity = 0.0
+            if open_position:
+                self.get_account_balance()
+                main_asset = float(self.balance['USDT'])
+                close = float(self.ohlc[4])
+                quantity = (leverage + 1) * main_asset / close
+            else:
+                acc_info = self.get_account_information()
+                for position in acc_info['positions']:
+                    if position['symbol'] == self.symbol:
+                        quantity = float(position['positionAmt'])
         return quantity
 
     def place_order(self, order: Order, **kwargs):
@@ -279,20 +295,23 @@ class BinanceTrader(Thread):
             )
             self.place_order(order=order)
 
-    def close_orders(self):
+    def close_order(self, order: Order):
         try:
-            self.client.futures_cancel_all_open_orders(
+            order_info = self.client.futures_cancel_order(
                 symbol=self.symbol,
                 timestamp=int(round(time()) * 1000) + self.time_offset,
-                recvWindow=5000
+                recvWindow=5000,
+                origClientOrderId=order.id,
             )
         except Exception as exc:
             log_warns.exception('Order cancel failed %s ', exc)
             return {'msg': exc}
+        order.update(params=dict(**order_info, closed=True))
+        return "closed"
 
     def order_update(self, response):
         """
-        Gets order status from server and repeats it if rejected
+        Updates order using self.user_data_stream (executionReport event) response
         """
         try:
             order = self.orders.get(self.orders.id == response['C'])
@@ -309,26 +328,6 @@ class BinanceTrader(Thread):
             order.update(params=response, status=order.status)
         elif order.status == self.ORDER_STATUS_CANCELED or order.status == self.ORDER_STATUS_EXPIRED:
             order.delete()
-
-    def check_profit_loss(self):
-        """
-        Counts profit/loss based of filled/partially filled orders
-
-        :return: float
-        """
-        bought = 0
-        sold = 0
-        all_orders = self.orders.select()
-        if all_orders:
-            for order in self.orders.select():
-                if order.params['status'] and order.params['status'] == self.ORDER_STATUS_FILLED or \
-                   order.params['status'] == self.ORDER_STATUS_PARTIALLY_FILLED:
-                    if order.params['side'] == 'BUY':
-                        bought += float(order.params['price']) * float(order.params['executedQty'])
-                    if order.params['side'] == 'SELL':
-                        sold += float(order.params['price']) * float(order.params['executedQty'])
-            profits = sold - bought
-            return round(profits, 2)
 
     def callback(self, msg):
         """

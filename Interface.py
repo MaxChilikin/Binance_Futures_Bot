@@ -40,8 +40,10 @@ class Interface:
                 if orders:
                     self.main_window[self.ml_key].print("")
                     for order in orders:
-                        order_params = dict(time=order.time, status=order.status, params=order.params,
-                                            failed=order.failed, long=order.long, short=order.short)
+                        order_params = dict(
+                            time=order.time, status=order.status, params=order.params, failed=order.failed,
+                            long=order.long, short=order.short, price=order.price,
+                        )
                         for key, value in order_params.items():
                             self.main_window[self.ml_key].print(f"{key}: {value}")
                         self.main_window[self.ml_key].print("")

@@ -1,4 +1,4 @@
-from playhouse.sqlite_ext import SqliteExtDatabase, Model, TextField, JSONField, BooleanField, TimestampField
+from playhouse.sqlite_ext import SqliteExtDatabase, Model, TextField, JSONField, BooleanField, TimestampField, FloatField
 import os
 
 db_name = 'Orders.db'
@@ -19,6 +19,7 @@ class Orders(BaseModel):
     short = BooleanField()
     time = TimestampField()
     failed = BooleanField()
+    price = FloatField()
     status = TextField()
 
 
