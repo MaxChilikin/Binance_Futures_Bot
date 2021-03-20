@@ -4,7 +4,6 @@ credentials.py
 strategy.py
 *.log
 *.html
-*.whl
 **probe.py
 
 # User-specific stuff:

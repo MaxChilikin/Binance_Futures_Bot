@@ -10,7 +10,7 @@ from plotly.offline import plot
 class Order:
 
     def __init__(self, params: dict, id_: str = None, long: bool = False, short: bool = False, time: str = None,
-                 failed: bool = False, canceled: bool = False, price: float = 0.0, db=None):
+                 failed: bool = False, price: float = 0.0, db=None):
         """
 
         :param id_: orderId or newClientOrderId
@@ -26,15 +26,14 @@ class Order:
         self.short = short
         self.time = time
         self.failed = failed
-        self.canceled = canceled
         self.status = "NEW"
         self.price = price
-        self.counter = 0
+        self.track_price = price
         self.db = db
 
     def to_db(self):
         self.db.create(id=self.id, params=self.params, long=self.long, short=self.short, time=self.time,
-                       failed=self.failed, canceled=self.canceled, status=self.status, price=self.price)
+                       failed=self.failed, status=self.status, price=self.price, track_price=self.track_price)
 
     def update(self, **kwargs):
         self.db.update(kwargs).where(self.db.id == self.id).execute()

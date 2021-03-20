@@ -20,6 +20,7 @@ class Orders(BaseModel):
     time = TimestampField()
     failed = BooleanField()
     price = FloatField()
+    track_price = FloatField()
     status = TextField()
 
 

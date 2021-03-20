@@ -42,7 +42,7 @@ class Interface:
                     for order in orders:
                         order_params = dict(
                             time=order.time, status=order.status, params=order.params, failed=order.failed,
-                            long=order.long, short=order.short, price=order.price,
+                            long=order.long, short=order.short, price=order.price, track_price=order.track_price,
                         )
                         for key, value in order_params.items():
                             self.main_window[self.ml_key].print(f"{key}: {value}")

@@ -9,7 +9,6 @@ from threading import Thread
 from sys import exit
 from Interface import Interface
 from Models import Orders
-from decimal import Decimal
 try:
     from credentials import API_KEY, API_SECRET
 except ImportError:
@@ -31,11 +30,12 @@ class BinanceTrader(Thread):
     KLINE_INTERVALS = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
 
     def __init__(self, symbol: str, interval: str, leverage: int, api_key: str, api_secret: str, ui, test: bool,
-                 *args, **kwargs):
+                 tracker: float, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.symbol = symbol
         self.interval = interval
         self.leverage = leverage
+        self.tracker = tracker
         self.balance = {}
         self.ohlc = []
         self.long, self.short = False, False
@@ -54,10 +54,7 @@ class BinanceTrader(Thread):
         self.get_exchange_info()
         klines = self.get_klines(interval=self.interval)
         self.get_account_balance()
-        strategy = Strategy(
-            klines=klines, symbol=self.symbol, leverage=self.leverage, quantity=self.get_quantity,
-            check_order=self.check_order, close_order=self.close_order, acc_info=self.get_account_information,
-        )
+        strategy = Strategy(klines=klines, symbol=self.symbol, leverage=self.leverage, quantity=self.get_quantity)
         self.start_kline_stream()
         sleep(5)
         while True:
@@ -74,7 +71,7 @@ class BinanceTrader(Thread):
                 if signals:
                     for signal in signals:
                         self.place_order(order=signal, test=self.test)
-            sl = strategy.stoploss(ohlc=self.ohlc, on_long=self.long, on_short=self.short)
+            sl = strategy.stoploss(ohlc=self.ohlc, on_long=self.long, on_short=self.short, tracker=self.tracker)
             if sl:
                 self.place_order(order=sl, test=self.test)
 
@@ -167,12 +164,12 @@ class BinanceTrader(Thread):
         for key, value in info.items():
             if key == 'assets':
                 for asset in info[key]:
-                    if Decimal(asset['walletBalance']) > 0:
+                    if float(asset['walletBalance']) > 0:
                         sorted_info[asset['asset']] = asset
                         self.balance[asset['asset']] = asset['walletBalance']
             elif key == 'positions':
                 for pos in info[key]:
-                    if Decimal(pos['positionAmt']) > 0 or Decimal(pos['positionAmt']) < 0:
+                    if float(pos['positionAmt']) > 0 or float(pos['positionAmt']) < 0:
                         sorted_info[pos['symbol']] = pos
             else:
                 sorted_info.setdefault(key, value)
@@ -196,6 +193,23 @@ class BinanceTrader(Thread):
         self.balance = account_balance
         return balance
 
+    def get_position(self):
+        """
+        Gets position for self.symbol
+
+        :rtype: list
+        """
+        try:
+            positions = self.client.futures_position_information(
+                symbol=self.symbol,
+                timestamp=int(round(time()) * 1000) + self.time_offset,
+                recvWindow=5000
+            )
+        except Exception as exc:
+            log_warns.exception('Position info pull failed %s ', exc)
+            return {'msg': exc}
+        return positions
+
     def get_quantity(self, leverage: int, open_position: bool = True):
         """
         Counts quantity using required leverage and account balance
@@ -208,14 +222,14 @@ class BinanceTrader(Thread):
         if self.ohlc:
             if open_position:
                 self.get_account_balance()
-                main_asset = float(self.balance['USDT'])
+                main_asset = float(self.balance["USDT"])
                 close = float(self.ohlc[4])
                 quantity = (leverage + 1) * main_asset / close
             else:
-                acc_info = self.get_account_information()
-                for position in acc_info['positions']:
-                    if position['symbol'] == self.symbol:
-                        quantity = float(position['positionAmt'])
+                positions = self.get_position()
+                for position in positions:
+                    if position["symbol"] == self.symbol:
+                        quantity = abs(float(position["positionAmt"]))
         return quantity
 
     def place_order(self, order: Order, **kwargs):
@@ -266,17 +280,9 @@ class BinanceTrader(Thread):
         order.to_db()
 
     def close_positions(self):
-        try:
-            positions = self.client.futures_position_information(
-                symbol=self.symbol,
-                timestamp=int(round(time()) * 1000) + self.time_offset,
-                recvWindow=5000
-            )
-        except Exception as exc:
-            log_warns.exception('Position info pull failed %s ', exc)
-            return {'msg': exc}
+        positions = self.get_position()
         for position in positions:
-            pos_quantity = Decimal(position["positionAmt"])
+            pos_quantity = float(position["positionAmt"])
             if pos_quantity > 0:
                 side = "SELL"
             elif pos_quantity < 0:
@@ -288,7 +294,7 @@ class BinanceTrader(Thread):
                     side=side,
                     type='MARKET',
                     symbol=self.symbol,
-                    quantity=position["positionAmt"]
+                    quantity=abs(pos_quantity)
                 ),
                 long=False,
                 short=False
@@ -338,13 +344,14 @@ class BinanceTrader(Thread):
 
 
 def main():
-    symbol, interval, leverage, test = 'BTCUSDT', '5m', 7, False
+    symbol, interval, leverage, tracker, test = 'BTCUSDT', '5m', 7, 0.005, False
     ui = Interface()
     ui.start_window()
     bot = BinanceTrader(
         symbol=symbol,
         interval=interval,
         leverage=leverage,
+        tracker=tracker,
         test=test,
         api_key=API_KEY,
         api_secret=API_SECRET,
