@@ -18,4 +18,4 @@ You can change trade symbol, leverage, stoploss percent or enable testmode in Bi
 > I'm still working on bot and going to add the above features to the interface
 
 ### Interface
-![interface_example](interface_example.bmp)
+![interface_example](additional/interface_example.bmp)
